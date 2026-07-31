@@ -1,8 +1,8 @@
-"""Acceptance tests (plan section 7). Plain asserts, no framework.
+"""Acceptance tests (plan section 7, plus the AOD-Net > SAIP > YOLO chain).
 
-  python tests/test_smoke.py             # 1, 2, 5, 6 -- no checkpoints, no network
-  python tests/test_smoke.py --models    # + 3, 4 (needs best.pt, the fusion
-                                         #   checkpoint, and a V-JEPA download)
+  python tests/test_smoke.py             # 1, 2, 5, 6, 7 -- no checkpoints, no network
+  python tests/test_smoke.py --models    # + 3, 4 (needs best.pt, the AOD-Net and
+                                         #   fusion checkpoints, and V-JEPA weights)
   python tests/test_smoke.py --models --image path.jpg   # use a real frame
 """
 
@@ -22,6 +22,8 @@ if str(DEMO) not in sys.path:
 import app                                              # noqa: E402
 import jepa_infer                                       # noqa: E402
 import radar_io                                         # noqa: E402
+import rgb_path                                         # noqa: E402
+from app import HEX                                     # noqa: E402
 from router import PIPE_ESC, PIPE_RGB, degradation, full_metrics  # noqa: E402
 
 RNG = np.random.default_rng(0)
@@ -60,16 +62,18 @@ def test_2_radar_io():
     print("  2 radar io           3-line round trip, pixel coords rejected")
 
 
-def test_3_image_yolo(yolo, image=None):
-    """Clear image, threshold 0.80 -> the YOLO branch, no escalation."""
+def test_3_image_yolo(yolo, aod, image=None):
+    """Clear image, threshold 0.80 -> the RGB chain, no escalation."""
     img = image or str(Path(tempfile.mkdtemp()) / "clear.png")
     if not image:
         cv2.imwrite(img, _noise(480, 640))
-    out, table, md = app.run_image(yolo, "", "RGB+radar", img, "", 0.80, 0.25)
+    out, table, verdict, md = app.run_image(yolo, aod, "", "", "RGB+radar", img, "", 0.80, 0.25)
     assert out is not None, md
-    assert "YOLO path fired" in md, md
-    assert "calibrated on IDD-AW" in md, md
-    print(f"  3 image / YOLO       banner YOLO, {len(table)} objects")
+    assert HEX[PIPE_RGB] in verdict, verdict
+    assert "AOD-Net" in verdict and "YOLO" in verdict, verdict
+    assert "SAIP skipped" in md, md              # no checkpoint -> stage skipped, said out loud
+    assert "calibrated on IDD-AW" in verdict, verdict
+    print(f"  3 image / RGB chain  AOD-Net > YOLO, {len(table)} objects")
 
 
 def test_4_image_jepa(jepa, image=None):
@@ -81,9 +85,9 @@ def test_4_image_jepa(jepa, image=None):
         cv2.imwrite(img, _fogged(480, 640))
     Path(img).with_suffix(".txt").write_text("0.2 0.3 0.3 0.4 car\n0.6 0.4 0.2 0.2 person\n")
 
-    out, table, md = app.run_image("", jepa, "RGB+radar", img, "", 0.50, 0.25)
+    out, table, verdict, md = app.run_image("", "", "", jepa, "RGB+radar", img, "", 0.50, 0.25)
     assert out is not None, md
-    assert "JEPA path fired" in md, md
+    assert HEX[PIPE_ESC] in verdict and "fusion head" in verdict, verdict
     assert len(table) == 2, table
     assert all(r[1] in jepa_infer.VALID_CLASSES for r in table), table
     print(f"  4 image / JEPA       {[r[1] for r in table]} at the radar boxes")
@@ -110,7 +114,7 @@ def test_5_video_switch():
     """
     tmp = Path(tempfile.mkdtemp())
     clip = _synthetic_clip(tmp / "in.mp4")
-    out, fig, rows, md = app.run_video("", "", "RGB+radar", clip, 0.50, 0.25,
+    out, fig, rows, md = app.run_video("", "", "", "", "RGB+radar", clip, 0.50, 0.25,
                                        every_n=1, max_frames=400, run_detectors=False)
     assert out is not None and fig is not None, md
     assert Path(out).stat().st_size > 0
@@ -128,33 +132,52 @@ def test_5_video_switch():
 
 
 def test_6_failure_modes():
-    """Every one of these must land in the UI as text, not kill the process."""
+    """Every one of these must land in the UI as a panel, not kill the process."""
     tmp = Path(tempfile.mkdtemp())
     img = str(tmp / "fog.png")
     cv2.imwrite(img, _fogged(240, 320))
 
-    out, _, md = app.run_image("", "", "RGB+radar", img, "", 0.10, 0.25)
-    assert out is None and "Error" in md and "radar" in md.lower(), md
+    def fails(*a, **kw):
+        out, _, verdict, md = app.run_image(*a, **kw)
+        assert out is None and 'verdict err' in verdict, verdict
+        return verdict + md
 
-    out, _, md = app.run_image("", "", "RGB+radar", str(tmp / "nope.png"), "", 0.80, 0.25)
-    assert out is None and "cannot read image" in md, md
+    assert "radar" in fails("", "", "", "", "RGB+radar", img, "", 0.10, 0.25).lower()
+    assert "cannot read image" in fails("", "", "", "", "RGB+radar",
+                                        str(tmp / "nope.png"), "", 0.80, 0.25)
 
     px = tmp / "pixels.txt"
     px.write_text("640 360 100 80 car\n")
-    out, _, md = app.run_image("", "", "RGB+radar", img, str(px), 0.10, 0.25)
-    assert out is None and "NORMALISED" in md, md
+    assert "NORMALISED" in fails("", "", "", "", "RGB+radar", img, str(px), 0.10, 0.25)
 
     bad = tmp / "bad.pth"
     torch.save({"foo": torch.randn(3), "bar": {"x": 1}}, bad)
     Path(img).with_suffix(".txt").write_text("0.2 0.3 0.3 0.4\n")
-    out, _, md = app.run_image("", str(bad), "RGB+radar", img, "", 0.10, 0.25)
-    assert out is None and "'foo'" in md, md          # the key list is shown
+    assert "&#x27;foo&#x27;" in fails("", "", "", str(bad), "RGB+radar", img, "", 0.10, 0.25) \
+        or "'foo'" in fails("", "", "", str(bad), "RGB+radar", img, "", 0.10, 0.25)
 
-    out, _, _, md = app.run_video("", "", "RGB+radar", str(tmp / "nope.mp4"), 0.80,
-                                  0.25, 5, 100, False)
+    assert "missing.pt" in fails(str(tmp / "missing.pt"), "", "", "", "RGB+radar",
+                                 img, "", 0.99, 0.25)
+
+    out, _, _, md = app.run_video("", "", "", "", "RGB+radar", str(tmp / "nope.mp4"),
+                                  0.80, 0.25, 5, 100, False)
     assert out is None and "Error" in md, md
-    print("  6 failure modes      radar missing / bad image / pixel coords / bad "
-          "checkpoint keys / bad video -- all shown, none fatal")
+    print("  6 failure modes      radar missing / bad image / pixel coords / bad checkpoint "
+          "keys / missing YOLO / bad video -- all shown, none fatal")
+
+
+def test_7_rgb_chain():
+    """AOD-Net -> SAIP -> YOLO: both stages applied, in order, output of one fed
+    straight to the next. Random SAIP weights are never loaded from disk."""
+    rgb_path.demo()
+    for name, fn in (("SAIP", rgb_path.load_saip_at), ("AOD-Net", rgb_path.load_aod_at)):
+        try:
+            fn(str(Path(tempfile.mkdtemp()) / "absent.pth"))
+            raise AssertionError(f"{name} loaded a checkpoint that does not exist")
+        except FileNotFoundError:
+            pass
+    assert rgb_path.load_stages("", "")[2] == ["YOLO"], "blank paths should skip both stages"
+    print("  7 rgb chain          AOD-Net > SAIP applied in order, missing checkpoints refused")
 
 
 # ------------------------------------------------------------------- main --
@@ -165,12 +188,13 @@ def main(with_models=False, image=None):
     test_2_radar_io()
     test_5_video_switch()
     test_6_failure_modes()
+    test_7_rgb_chain()
 
     if not with_models:
         print("  3,4 skipped          checkpoint tests: rerun with --models")
         return
     root = DEMO.parent
-    test_3_image_yolo(str(root / "best.pt"), image)
+    test_3_image_yolo(str(root / "best.pt"), str(root / "aodnet_mixed_finetuned.pth.zip"), image)
     test_4_image_jepa(str(root / "fog_fusion_head_v3_ensemble_best.pth"), image)
 
 
