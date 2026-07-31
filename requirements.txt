@@ -1,0 +1,9 @@
+gradio
+ultralytics
+transformers
+torch
+opencv-python
+pillow
+matplotlib
+numpy
+imageio-ffmpeg      # H.264 writer; OpenCV's mp4v output will not play in a browser
